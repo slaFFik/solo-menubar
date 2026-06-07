@@ -5,7 +5,7 @@
 # <xbar.author.github>slaFFik</xbar.author.github>
 # <xbar.desc>Shows Solo projects that currently have a running process.</xbar.desc>
 # <xbar.abouturl>https://github.com/slaFFik/solo-menubar</xbar.abouturl>
-# <xbar.image></xbar.image>
+# <xbar.image>https://raw.githubusercontent.com/slaFFik/solo-menubar/refs/heads/main/assets/screenshot.png</xbar.image>
 # <xbar.dependencies>python3,Solo</xbar.dependencies>
 #
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
@@ -24,7 +24,9 @@
 import base64
 import json
 import os
+import struct
 import urllib.request
+import zlib
 from collections import defaultdict
 
 DISCOVERY = os.path.expanduser("~/.config/soloterm/http-api.json")
@@ -39,6 +41,76 @@ ICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAAAXNSR0IArs4c6QAAAHhl
 
 def icon_param():
     return "image=" + ICON_B64
+
+
+# Active-project indicator: a small green donut. SwiftBar renders SF Symbols as
+# template (monochrome) images and tints them to the menu's label color, so
+# sfcolor/sfconfig can't actually colorize them in a dropdown — a base64 PNG via
+# image= is the only way to get a true-color glyph. We draw it here at runtime
+# with the standard library so the plugin keeps zero third-party dependencies.
+# Tune these three:
+RING_COLOR = (0x1B, 0x88, 0x2D)  # #1B882D
+RING_PT = 9                      # on-screen diameter, in points
+RING_STROKE = 0.22               # ring thickness as a fraction of the diameter
+RING_DROP = 1.5                  # points to sink the ring. SwiftBar centers the
+                                 # icon on the font's box, which rides above
+                                 # lowercase text; this drops it onto the optical
+                                 # center. Raise to move down, lower to move up.
+
+
+def _png(width, height, rgba, dpi):
+    """Encode a row-major RGBA byte buffer (4 bytes/px) as a PNG."""
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    # pHYs carries the resolution so NSImage reports the intended point size;
+    # baking 144 dpi means the 2x-pixel PNG renders crisply at RING_PT on Retina.
+    ppm = int(round(dpi / 0.0254))
+    phys = struct.pack(">IIB", ppm, ppm, 1)
+    stride = width * 4
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # filter type 0 (none) for each scanline
+        raw.extend(rgba[y * stride:(y + 1) * stride])
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", ihdr) +
+            chunk(b"pHYs", phys) +
+            chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
+            chunk(b"IEND", b""))
+
+
+def ring_b64():
+    """Anti-aliased green donut as a base64 PNG (supersampled, then averaged)."""
+    px = RING_PT * 2            # render at 2x; pHYs below bakes the matching dpi
+    ss = 4                      # supersample factor for smooth edges
+    n = px * ss
+    outer = n / 2 - ss          # a hair of padding so the ring never clips
+    inner = outer * (1 - 2 * RING_STROKE)
+    center = (n - 1) / 2
+    cov = [0.0] * (px * px)
+    for sy in range(n):
+        dy = sy - center
+        row = (sy // ss) * px
+        for sx in range(n):
+            dx = sx - center
+            if inner <= (dx * dx + dy * dy) ** 0.5 <= outer:
+                cov[row + sx // ss] += 1
+    area = ss * ss
+    r, g, b = RING_COLOR
+    # Transparent rows on top sink the (center-aligned) icon: with bottom padding
+    # zero, the ring's center lands pad/2 px below the canvas center. At 2x, that
+    # is RING_DROP points lower when pad = RING_DROP * 4.
+    pad = int(round(RING_DROP * 4))
+    height = px + pad
+    out = bytearray(px * height * 4)
+    base = pad * px
+    for i, c in enumerate(cov):
+        j = (base + i) * 4
+        out[j], out[j + 1], out[j + 2] = r, g, b
+        out[j + 3] = int(round(255 * c / area))
+    return base64.b64encode(_png(px, height, bytes(out), 144)).decode()
 
 
 def origin():
@@ -94,12 +166,13 @@ def main():
     if not active:
         print("No active projects | color=#999999")
     else:
+        ring = ring_b64()
         for (proj_id, name), plist in sorted(active.items(), key=lambda kv: kv[0][1].lower()):
             running = [x for x in plist if x.get("status") == "running"]
             # Project header opens Solo at the project's first running process.
             head = running[0]
             print(f"{name} | href={deeplink(proj_id, head['id'], head['name'])} "
-                  f"sfimage=circle.fill sfcolor=#34c759")
+                  f"image={ring}")
             # Each agent row deep-links to its own process.
             for x in running:
                 print(f"--{x['name']} | href={deeplink(proj_id, x['id'], x['name'])}")
