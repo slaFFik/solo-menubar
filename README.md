@@ -4,20 +4,7 @@ A tiny macOS menu bar widget that shows which of your [Solo](https://soloterm.co
 
 Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://github.com/matryer/xbar)) plugin. Pure Python, no third‑party dependencies, no API token.
 
-```
- ◆  ← Solo logo in the menu bar
- ─────────────────────────────
- ● lgtm                        → opens Solo at this project
-     └ Terminal                → opens that exact terminal
- ● solo-counselors
-     └ Claude
- ● wp-pdf-plugin
-     └ Claude
-     └ codex-pr676-review
- ─────────────────────────────
- Open Solo
- Refresh
-```
+![Solo Menubar showing active projects in a SwiftBar dropdown](assets/screenshot.png)
 
 ## What it does
 
