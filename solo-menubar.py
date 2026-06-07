@@ -3,7 +3,7 @@
 # <xbar.version>1.0</xbar.version>
 # <xbar.author>Slava Abakumov</xbar.author>
 # <xbar.author.github>slaFFik</xbar.author.github>
-# <xbar.desc>Shows Solo projects that currently have a running process.</xbar.desc>
+# <xbar.desc>Shows Solo projects with a running process; toggle to show all.</xbar.desc>
 # <xbar.abouturl>https://github.com/slaFFik/solo-menubar</xbar.abouturl>
 # <xbar.image>https://raw.githubusercontent.com/slaFFik/solo-menubar/refs/heads/main/assets/screenshot.png</xbar.image>
 # <xbar.dependencies>python3,Solo</xbar.dependencies>
@@ -13,24 +13,32 @@
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
 # <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
+# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>
 #
 # Reads Solo's local HTTP control plane (no auth token needed for the bare
-# read-only endpoints) and lists every project with at least one running
-# process. Solo must be running with the HTTP API enabled.
+# read-only endpoints) and lists Solo projects. By default it shows only those
+# with a running process; a menu toggle switches to all projects. Solo must be
+# running with the HTTP API enabled.
 #
-# Drop this file in your SwiftBar plugin folder. The "5s" in the filename
-# sets the refresh interval (every 5 seconds).
+# Symlink this file into your SwiftBar plugin folder. With no interval in the
+# filename (solo-menubar.py), SwiftBar refreshes it only when the menu opens (via
+# the swiftbar.refreshOnOpen flag above) and on launch — no background polling.
+# Add an interval to poll too, e.g. solo-menubar.30s.py for every 30 seconds.
 
 import base64
 import json
 import os
 import struct
+import sys
 import urllib.request
 import zlib
-from collections import defaultdict
 
 DISCOVERY = os.path.expanduser("~/.config/soloterm/http-api.json")
 DEFAULT_ORIGIN = "http://127.0.0.1:24678"
+
+# Persisted UI preferences, toggled from the menu and re-read on every refresh.
+# Kept out of Solo's own config dir so it is clearly ours.
+SETTINGS = os.path.expanduser("~/.config/solo-menubar/settings.json")
 
 # Menu bar icon: base64-encoded PNG embedded directly so SwiftBar does not
 # treat a sidecar image file as its own (broken) plugin. To change the icon,
@@ -49,7 +57,10 @@ def icon_param():
 # image= is the only way to get a true-color glyph. We draw it here at runtime
 # with the standard library so the plugin keeps zero third-party dependencies.
 # Tune these three:
-RING_COLOR = (0x1B, 0x88, 0x2D)  # #1B882D
+RING_COLOR = (0x1B, 0x88, 0x2D)     # #1B882D — active project
+INACTIVE_COLOR = (0x8E, 0x8E, 0x93)  # systemGray ring — idle project (only in "all" view)
+INACTIVE_LABEL = "#333333,#9b9b9b"   # idle project name (light,dark): dim but readable
+BRANCH_COLOR = "#666666,#9b9b9b"     # the "└ N TODOs · M scratchpads" tree row
 RING_PT = 9                      # on-screen diameter, in points
 RING_STROKE = 0.22               # ring thickness as a fraction of the diameter
 RING_DROP = 1.5                  # points to sink the ring. SwiftBar centers the
@@ -81,8 +92,8 @@ def _png(width, height, rgba, dpi):
             chunk(b"IEND", b""))
 
 
-def ring_b64():
-    """Anti-aliased green donut as a base64 PNG (supersampled, then averaged)."""
+def ring_b64(color=RING_COLOR):
+    """Anti-aliased donut as a base64 PNG (supersampled, then averaged)."""
     px = RING_PT * 2            # render at 2x; pHYs below bakes the matching dpi
     ss = 4                      # supersample factor for smooth edges
     n = px * ss
@@ -98,7 +109,7 @@ def ring_b64():
             if inner <= (dx * dx + dy * dy) ** 0.5 <= outer:
                 cov[row + sx // ss] += 1
     area = ss * ss
-    r, g, b = RING_COLOR
+    r, g, b = color
     # Transparent rows on top sink the (center-aligned) icon: with bottom padding
     # zero, the ring's center lands pad/2 px below the canvas center. At 2x, that
     # is RING_DROP points lower when pad = RING_DROP * 4.
@@ -128,6 +139,74 @@ def get(path):
         return json.load(r)
 
 
+def load_settings():
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    with open(SETTINGS, "w") as f:
+        json.dump(data, f)
+
+
+def toggle_setting(key):
+    s = load_settings()
+    s[key] = not s.get(key, False)
+    save_settings(s)
+
+
+def api_config():
+    """(baseUrl, token) for Solo's authenticated /api endpoints, read from the
+    same discovery file as origin(). The token is local — Solo writes it there —
+    so todo/scratchpad counts still need nothing from the user. (None, None) if
+    unavailable."""
+    try:
+        with open(DISCOVERY) as f:
+            cfg = json.load(f)
+        base = cfg.get("baseUrl") or cfg.get("origin", DEFAULT_ORIGIN) + "/api"
+        return base, cfg.get("token")
+    except Exception:
+        return None, None
+
+
+def get_auth(base, token, path):
+    req = urllib.request.Request(base + path)
+    req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=2) as r:
+        return json.load(r).get("data", {})
+
+
+def project_counts(base, token, pid, want_todos, want_pads):
+    """(open todo count, unarchived scratchpad count) for a project — only what
+    is asked for. Failures degrade to zero so the menu never breaks."""
+    todos = pads = 0
+    try:
+        if want_todos:
+            data = get_auth(base, token, f"/projects/{pid}/todos")
+            todos = sum(1 for t in data.get("todos", []) if not t.get("completed"))
+        if want_pads:
+            data = get_auth(base, token, f"/projects/{pid}/scratchpads")
+            pads = sum(1 for s in data.get("scratchpads", []) if not s.get("archived"))
+    except Exception:
+        pass
+    return todos, pads
+
+
+def count_row(todos, pads, show_todos, show_pads):
+    """The combined '└ N TODOs · M scratchpads' label, or None when there is
+    nothing to show. Only enabled, non-zero counts appear."""
+    parts = []
+    if show_todos and todos:
+        parts.append(f"{todos} TODO" + ("" if todos == 1 else "s"))
+    if show_pads and pads:
+        parts.append(f"{pads} scratchpad" + ("" if pads == 1 else "s"))
+    return "└ " + " · ".join(parts) if parts else None
+
+
 def deeplink(project_id, process_id, name):
     """Solo deep link to a specific process. The slug before '--' is cosmetic;
     Solo resolves the target by the trailing numeric process id."""
@@ -138,10 +217,19 @@ def deeplink(project_id, process_id, name):
     return f"solo://proj/{project_id}/process/{slug}--{process_id}"
 
 
+def clean(text):
+    """Make a name safe for a SwiftBar line: '|' starts the params section and a
+    newline starts a new menu item, so neutralize the pipe and collapse any
+    whitespace (newlines, tabs) to single spaces."""
+    return " ".join(text.replace("|", "│").split())
+
+
 def main():
     try:
-        # No-auth, snake_case endpoint: [{id,name,command,status,project_id,project_name}]
-        procs = get("/processes")
+        # GET /projects -> every project, each with a nested processes[] list
+        # ({id, name, command, status, ...}). Superset of /processes, so it
+        # serves both the "active only" and "all projects" views.
+        projects = get("/projects")
     except Exception:
         print(f" | {icon_param()}")
         print("---")
@@ -149,38 +237,74 @@ def main():
         print("Open Solo | bash=/usr/bin/open param1=-a param2=Solo terminal=false")
         return
 
-    groups = defaultdict(list)
-    for p in procs:
-        groups[(p["project_id"], p["project_name"])].append(p)
+    settings = load_settings()
+    show_all = bool(settings.get("show_all", False))
+    show_todos = bool(settings.get("show_todos", False))
+    show_pads = bool(settings.get("show_scratchpads", False))
 
-    # Active project == has at least one process with status "running".
-    active = {
-        k: v for k, v in groups.items()
-        if any(x.get("status") == "running" for x in v)
-    }
+    # Todo/scratchpad counts come from authenticated /api endpoints; fetch the
+    # local token only when a counts toggle is on, and degrade if it's missing.
+    api_base, token = api_config() if (show_todos or show_pads) else (None, None)
+    counts_on = bool(token) and (show_todos or show_pads)
 
     # Menu bar title: Solo logo only.
     print(f" | {icon_param()}")
     print("---")
 
-    if not active:
+    visible = []
+    for proj in projects:
+        running = [p for p in proj.get("processes", []) if p.get("status") == "running"]
+        if running or show_all:
+            visible.append((proj, running))
+
+    if not visible:
         print("No active projects | color=#999999")
     else:
-        ring = ring_b64()
-        for (proj_id, name), plist in sorted(active.items(), key=lambda kv: kv[0][1].lower()):
-            running = [x for x in plist if x.get("status") == "running"]
-            # Project header opens Solo at the project's first running process.
-            head = running[0]
-            print(f"{name} | href={deeplink(proj_id, head['id'], head['name'])} "
-                  f"image={ring}")
-            # Each agent row deep-links to its own process.
-            for x in running:
-                print(f"--{x['name']} | href={deeplink(proj_id, x['id'], x['name'])}")
+        active_icon = ring_b64()
+        idle_icon = ring_b64(INACTIVE_COLOR) if show_all else None
+        for proj, running in sorted(visible, key=lambda v: v[0]["name"].lower()):
+            pid, name = proj["id"], proj["name"]
+            procs = proj.get("processes", [])
+            # Open Solo focused on a process; prefer a running one. A bare
+            # solo://proj/{id} link opens Settings, not the project, so we always
+            # target a process — the header and the counts row share this link.
+            target = running[0] if running else (procs[0] if procs else None)
+            href = f" href={deeplink(pid, target['id'], target['name'])}" if target else ""
+            if running:
+                print(f"{clean(name)} |{href} image={active_icon}")
+                # Each running agent deep-links to its own process.
+                for x in running:
+                    print(f"--{clean(x['name'])} | href={deeplink(pid, x['id'], x['name'])}")
+            else:
+                # Idle project (only in "all" view): grey ring, dimmed.
+                print(f"{clean(name)} |{href} image={idle_icon} color={INACTIVE_LABEL}")
+            # Optional '└ N TODOs · M scratchpads' tree row, under any project.
+            if counts_on:
+                todos, pads = project_counts(api_base, token, pid, show_todos, show_pads)
+                row = count_row(todos, pads, show_todos, show_pads)
+                if row:
+                    print(f"--{row} |{href} color={BRANCH_COLOR}")
 
     print("---")
+    py, script = sys.executable, os.path.abspath(__file__)
+
+    def toggle(label, key, on):
+        return (f"{label} | checked={'true' if on else 'false'} bash={py} "
+                f"param1={script} param2=--toggle-{key.replace('_', '-')} "
+                f"terminal=false refresh=true")
+
+    print(toggle("Show all projects", "show_all", show_all))
+    print(toggle("Show TODOs", "show_todos", show_todos))
+    print(toggle("Show Scratchpads", "show_scratchpads", show_pads))
     print("Open Solo | bash=/usr/bin/open param1=-a param2=Solo terminal=false")
     print("Refresh | refresh=true")
 
 
 if __name__ == "__main__":
-    main()
+    KEYS = {"show_all", "show_todos", "show_scratchpads"}
+    toggled = next((a[len("--toggle-"):].replace("-", "_")
+                    for a in sys.argv[1:] if a.startswith("--toggle-")), None)
+    if toggled in KEYS:
+        toggle_setting(toggled)
+    else:
+        main()

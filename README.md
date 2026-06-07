@@ -2,7 +2,7 @@
 
 A tiny macOS menu bar widget that shows which of your [Solo](https://soloterm.com) projects have a **running agent or process** — and lets you jump straight into any of them with a single click.
 
-Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://github.com/matryer/xbar)) plugin. Pure Python, no third‑party dependencies, no API token.
+Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://github.com/matryer/xbar)) plugin. Pure Python, no third‑party dependencies, no remote requests.
 
 ![Solo Menubar showing active projects in a SwiftBar dropdown](assets/screenshot.png)
 
@@ -10,8 +10,9 @@ Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://g
 
 - Puts the Solo logo in your menu bar.
 - Click it to see every project that currently has at least one **running** process (i.e. an "active" project).
+- Optional toggles (all off by default) to also list idle projects and show per‑project TODO / scratchpad counts — see [Options](#options) below.
 - Each project — and each individual agent/terminal under it — is a clickable **deep link** that opens Solo focused on that exact process.
-- Refreshes automatically every 5 seconds.
+- Refreshes the moment you open the menu — no background polling.
 - Shows a friendly *"Solo not running"* state when Solo is closed or its HTTP API is off.
 
 ## Requirements
@@ -23,7 +24,7 @@ Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://g
 
 ### Enable Solo's HTTP API
 
-The plugin reads Solo's local control plane. Enable the HTTP API in Solo's settings — Solo then writes a discovery file to `~/.config/soloterm/http-api.json`. The plugin only uses the **read‑only, unauthenticated** endpoints, so it never needs your API token.
+The plugin reads Solo's local control plane. Enable the HTTP API in Solo's settings — Solo then writes a discovery file to `~/.config/soloterm/http-api.json`, which the plugin reads to find the API.
 
 ## Installation
 
@@ -32,50 +33,53 @@ The plugin reads Solo's local control plane. Enable the HTTP API in Solo's setti
 git clone https://github.com/slaFFik/solo-menubar.git ~/Projects/solo-menubar
 
 # 2. Make sure it's executable
-chmod +x ~/Projects/solo-menubar/solo.5s.py
+chmod +x ~/Projects/solo-menubar/solo-menubar.py
 
 # 3. Symlink it into your SwiftBar plugin folder
-ln -s ~/Projects/solo-menubar/solo.5s.py ~/Documents/SwiftBar/solo.5s.py
+ln -s ~/Projects/solo-menubar/solo-menubar.py ~/Documents/SwiftBar/solo-menubar.py
 ```
 
 Point SwiftBar at your plugin folder (e.g. `~/Documents/SwiftBar`) and the icon appears right away. SwiftBar follows the symlink, so you can keep editing the file in the repo and SwiftBar always runs the latest version.
 
 ## How it works
 
-Every 5 seconds the plugin:
+Each time you open the menu (and once on launch), the plugin:
 
 1. Reads `origin` from `~/.config/soloterm/http-api.json` (falls back to `http://127.0.0.1:24678`), so it survives Solo restarting on a different port.
-2. Calls `GET /processes` — Solo's no‑auth local endpoint.
-3. Groups processes by project and keeps any project that has a process whose `status` is `running`.
+2. Calls `GET /projects` — Solo's no‑auth local endpoint listing every project and its processes.
+3. Keeps any project that has a process whose `status` is `running` (or all projects, if you toggle that on).
 4. Renders a clickable deep link per project/process:
    `solo://proj/{project_id}/process/{slug}--{process_id}`
 
-The deep‑link *slug* is cosmetic — Solo resolves the target by the trailing process id — and that id is Solo's stable database id, so links keep working even after a process restarts.
+It refreshes on open via SwiftBar's `refreshOnOpen` flag, so the list is always current the instant you click — without polling Solo in the background.
 
 ## Configuration
 
-**Refresh interval** — encoded in the filename. Rename the file to change it:
+**Refresh** — by default the file is named `solo-menubar.py` (no interval), so SwiftBar refreshes it only when you open the menu. The menu bar icon is static, so background polling buys nothing. If you *do* want it to poll as well, encode an interval in the filename:
 
-| Filename | Interval |
+| Filename | Behavior |
 | --- | --- |
-| `solo.2s.py` | 2 seconds |
-| `solo.5s.py` | 5 seconds *(default)* |
-| `solo.10s.py` | 10 seconds |
-| `solo.1m.py` | 1 minute |
+| `solo-menubar.py` | Refresh on menu open only *(default)* |
+| `solo-menubar.10s.py` | Also poll every 10 seconds |
+| `solo-menubar.1m.py` | Also poll every minute |
 
-**Menu bar icon** — the icon is a base64‑encoded PNG embedded in the script (`ICON_B64`) so SwiftBar doesn't mistake a sidecar image file for another plugin. To swap it, regenerate the constant from any PNG:
+(Rename the symlink in your SwiftBar plugin folder — SwiftBar reads the interval from the filename it sees there.)
 
-```bash
-python3 -c "import base64;print(base64.b64encode(open('icon.png','rb').read()).decode())"
-```
+### Options
 
-> **Tip:** bake a Retina‑friendly resolution into the PNG so it fits the menu bar. `sips -s dpiWidth 144 -s dpiHeight 144 icon.png` makes a 36px image render at 18pt — the macOS menu‑bar sweet spot.
+Toggles at the bottom of the menu. All are **off by default**, and your choices are remembered between launches.
+
+| Option | What it does |
+| --- | --- |
+| **Show all projects** | List every project, not just those with a running process. Idle projects appear greyed out. |
+| **Show TODOs** | Under each project, show its number of open TODOs (only when above zero). |
+| **Show Scratchpads** | Under each project, show its number of scratchpads (only when above zero). |
 
 ## Troubleshooting
 
 - **"Solo not running or HTTP API off"** — start Solo and enable its HTTP API in settings.
 - **Nothing shows in the menu bar** — confirm SwiftBar's plugin folder is set, the file is executable (`chmod +x`), and `python3` is installed (`xcode-select --install`).
-- **Menu doesn't update while it's open** — macOS renders a menu at the moment you open it; close and reopen to see fresh data. The data itself keeps refreshing in the background.
+- **Menu doesn't update while it's open** — macOS renders a menu at the moment you open it; the plugin re‑reads Solo on each open, so just close and reopen to see fresh data.
 
 ## Credits
 
