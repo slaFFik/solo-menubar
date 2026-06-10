@@ -13,18 +13,21 @@ Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://g
 - Optional toggles (all off by default) to also list idle projects and show per‑project TODO / scratchpad counts — see [Options](#options) below.
 - Each project — and each individual agent/terminal under it — is a clickable **deep link** that opens Solo focused on that exact process.
 - Refreshes the moment you open the menu — no background polling.
-- Shows a friendly *"Solo not running"* state when Solo is closed or its HTTP API is off.
+- Shows a friendly error state that tells you whether Solo is closed, its HTTP API is off, or the API just isn't responding.
 
 ## Requirements
 
 - macOS
 - [SwiftBar](https://github.com/swiftbar/SwiftBar) — `brew install swiftbar` (xbar works too)
 - Python 3 (`python3` on your `PATH`; only the standard library is used)
-- [Solo](https://soloterm.com) running with its **HTTP API enabled**
+- [Solo](https://soloterm.com) **0.8.2 or newer** running with its **HTTP API enabled**
+
+> [!NOTE]
+> Tested against **Solo 0.8.2**. Solo's HTTP API is still evolving and may change in future releases — a Solo update can break the plugin until it's adapted. If the menu suddenly shows *"Solo API changed — update this plugin"* (or an error row that won't go away) right after a Solo update, check here for a newer plugin version. You can Watch for new Releases.
 
 ### Enable Solo's HTTP API
 
-The plugin reads Solo's local control plane. Enable the HTTP API in Solo's settings — Solo then writes a discovery file to `~/.config/soloterm/http-api.json`, which the plugin reads to find the API.
+The plugin reads Solo's local control plane. Enable the HTTP API in Solo's settings — Solo then writes a discovery file to `~/.config/soloterm/http-api.json`, which the plugin reads to find the API's base URL and its local auth token. No setup beyond the toggle: Solo writes the token itself, and nothing ever leaves your machine.
 
 ## Installation
 
@@ -45,9 +48,9 @@ Point SwiftBar at your plugin folder (e.g. `~/Documents/SwiftBar`) and the icon 
 
 Each time you open the menu (and once on launch), the plugin:
 
-1. Reads `origin` from `~/.config/soloterm/http-api.json` (falls back to `http://127.0.0.1:24678`), so it survives Solo restarting on a different port.
-2. Calls `GET /projects` — Solo's no‑auth local endpoint listing every project and its processes.
-3. Keeps any project that has a process whose `status` is `running` (or all projects, if you toggle that on).
+1. Reads the API base URL and bearer token from `~/.config/soloterm/http-api.json`, so it survives Solo restarting on a different port and never needs credentials from you.
+2. Calls `GET /api/projects` and `GET /api/processes?status=running` (the unfiltered process list when *Show all projects* is on) and joins them by project. TODO/scratchpad counts, when toggled on, come from each list endpoint's `totalCount` via concurrent `limit=1` probes — one item per request instead of the full list.
+3. Keeps any project that has a running process (or all projects, if you toggle that on).
 4. Renders a clickable deep link per project/process:
    `solo://proj/{project_id}/process/{slug}--{process_id}`
 
@@ -71,13 +74,16 @@ Toggles at the bottom of the menu. All are **off by default**, and your choices 
 
 | Option | What it does |
 | --- | --- |
-| **Show all projects** | List every project, not just those with a running process. Idle projects appear greyed out. |
+| **Show all projects** | List every project, not just those with a running process. Idle projects appear greyed out. The toggle label shows the total project count. |
 | **Show TODOs** | Under each project, show its number of open TODOs (only when above zero). |
 | **Show Scratchpads** | Under each project, show its number of scratchpads (only when above zero). |
 
 ## Troubleshooting
 
-- **"Solo not running or HTTP API off"** — start Solo and enable its HTTP API in settings.
+- **"Solo HTTP API not enabled"** — Solo has never written its discovery file; turn the HTTP API on in Solo's settings.
+- **"Solo not running"** — open Solo. If it *is* open, re-enable its HTTP API so it rewrites the discovery file.
+- **"Solo is running, but its HTTP API isn't responding"** — toggle the HTTP API off and on, or restart Solo.
+- **"Solo API changed — update this plugin"** — your Solo speaks a newer API contract than this plugin; grab the [latest plugin release](https://github.com/slaFFik/solo-menubar/releases).
 - **Nothing shows in the menu bar** — confirm SwiftBar's plugin folder is set, the file is executable (`chmod +x`), and `python3` is installed (`xcode-select --install`).
 - **Menu doesn't update while it's open** — macOS renders a menu at the moment you open it; the plugin re‑reads Solo on each open, so just close and reopen to see fresh data.
 

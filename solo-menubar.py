@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <xbar.title>Solo - Active Projects</xbar.title>
-# <xbar.version>1.0</xbar.version>
+# <xbar.version>1.1.0</xbar.version>
 # <xbar.author>Slava Abakumov</xbar.author>
 # <xbar.author.github>slaFFik</xbar.author.github>
 # <xbar.desc>Shows Solo projects with a running process; toggle to show all.</xbar.desc>
@@ -15,10 +15,12 @@
 # <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 # <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>
 #
-# Reads Solo's local HTTP control plane (no auth token needed for the bare
-# read-only endpoints) and lists Solo projects. By default it shows only those
-# with a running process; a menu toggle switches to all projects. Solo must be
-# running with the HTTP API enabled.
+# Reads Solo's local HTTP control plane and lists Solo projects. Since Solo
+# 0.8.2 every endpoint lives under /api behind bearer auth; the token comes
+# from Solo's own discovery file, so the widget still needs nothing from the
+# user. By default it shows only projects with a running process; a menu
+# toggle switches to all projects. Solo (>= 0.8.2) must be running with the
+# HTTP API enabled.
 #
 # Symlink this file into your SwiftBar plugin folder. With no interval in the
 # filename (solo-menubar.py), SwiftBar refreshes it only when the menu opens (via
@@ -32,9 +34,15 @@ import struct
 import sys
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 DISCOVERY = os.path.expanduser("~/.config/soloterm/http-api.json")
-DEFAULT_ORIGIN = "http://127.0.0.1:24678"
+API_VERSION = "1"  # Solo's bump-on-break HTTP API contract version we speak
+
+# Solo is strictly local, so bypass proxies: the default urllib opener honors
+# http_proxy/https_proxy and macOS system proxy settings, which would route
+# 127.0.0.1 — bearer token included — through a proxy and break the menu.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Persisted UI preferences, toggled from the menu and re-read on every refresh.
 # Kept out of Solo's own config dir so it is clearly ours.
@@ -124,19 +132,26 @@ def ring_b64(color=RING_COLOR):
     return base64.b64encode(_png(px, height, bytes(out), 144)).decode()
 
 
-def origin():
-    """Base URL of Solo's HTTP API. Port can change across Solo restarts,
-    so prefer the value Solo writes to its discovery file."""
-    try:
-        with open(DISCOVERY) as f:
-            return json.load(f).get("origin", DEFAULT_ORIGIN)
-    except Exception:
-        return DEFAULT_ORIGIN
+class ApiChanged(Exception):
+    """The discovery file advertises an API contract this plugin doesn't speak."""
 
 
-def get(path):
-    with urllib.request.urlopen(origin() + path, timeout=2) as r:
-        return json.load(r)
+def api_config():
+    """(base URL, token) of Solo's authenticated /api endpoints, from the
+    discovery file Solo maintains. The port can change across Solo restarts and
+    every request needs the bearer token, so both come from there. Raises when
+    the file, token, or base URL is missing — the caller shows the 'not
+    running' row."""
+    with open(DISCOVERY) as f:
+        cfg = json.load(f)
+    # An apiVersion other than ours deserves its own row — 'not running' would
+    # misdiagnose a Solo update. Absent means an old/stale file; let the
+    # request itself fail into the generic row.
+    version = cfg.get("apiVersion")
+    if version is not None and str(version) != API_VERSION:
+        raise ApiChanged(version)
+    base = cfg.get("apiBaseUrl") or cfg["origin"] + "/api"
+    return base, cfg["token"]
 
 
 def load_settings():
@@ -149,8 +164,13 @@ def load_settings():
 
 def save_settings(data):
     os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-    with open(SETTINGS, "w") as f:
+    # Write-then-rename: SwiftBar runs a toggle process and a refresh render
+    # concurrently, so a reader must never see a half-written file, and a
+    # killed toggle must not leave corrupt JSON that resets every preference.
+    tmp = SETTINGS + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+    os.replace(tmp, SETTINGS)
 
 
 def toggle_setting(key):
@@ -159,38 +179,47 @@ def toggle_setting(key):
     save_settings(s)
 
 
-def api_config():
-    """(baseUrl, token) for Solo's authenticated /api endpoints, read from the
-    same discovery file as origin(). The token is local — Solo writes it there —
-    so todo/scratchpad counts still need nothing from the user. (None, None) if
-    unavailable."""
-    try:
-        with open(DISCOVERY) as f:
-            cfg = json.load(f)
-        base = cfg.get("baseUrl") or cfg.get("origin", DEFAULT_ORIGIN) + "/api"
-        return base, cfg.get("token")
-    except Exception:
-        return None, None
-
-
 def get_auth(base, token, path):
     req = urllib.request.Request(base + path)
     req.add_header("Authorization", "Bearer " + token)
-    with urllib.request.urlopen(req, timeout=2) as r:
-        return json.load(r).get("data", {})
+    with OPENER.open(req, timeout=2) as r:
+        # Index strictly: if Solo ever changes the envelope, fail into the
+        # error row rather than render a healthy-looking empty menu.
+        return json.load(r)["data"]
+
+
+def get_all(base, token, path, key):
+    """Every item from a paginated list endpoint, following nextOffset pages
+    until hasMore goes false. Asks for big pages (the server clamps at its own
+    maximum) so the common case is a single request. A cursor that stalls or
+    disappears raises instead of looping forever or silently truncating."""
+    sep = "&" if "?" in path else "?"
+    items, offset = [], 0
+    while True:
+        data = get_auth(base, token, f"{path}{sep}limit=200&offset={offset}")
+        items.extend(data[key])
+        if not data.get("hasMore"):
+            return items
+        nxt = data.get("nextOffset")
+        if nxt is None or nxt <= offset:
+            raise ValueError(f"pagination stalled at offset {offset}")
+        offset = nxt
 
 
 def project_counts(base, token, pid, want_todos, want_pads):
     """(open todo count, unarchived scratchpad count) for a project — only what
-    is asked for. Failures degrade to zero so the menu never breaks."""
+    is asked for. The server filters (completed=false; scratchpads exclude
+    archived unless asked) and reports totalCount, so limit=1 fetches each
+    count without the items. Failures degrade to zero so the menu never
+    breaks."""
     todos = pads = 0
     try:
         if want_todos:
-            data = get_auth(base, token, f"/projects/{pid}/todos")
-            todos = sum(1 for t in data.get("todos", []) if not t.get("completed"))
+            data = get_auth(base, token, f"/projects/{pid}/todos?completed=false&limit=1")
+            todos = data.get("totalCount", 0)
         if want_pads:
-            data = get_auth(base, token, f"/projects/{pid}/scratchpads")
-            pads = sum(1 for s in data.get("scratchpads", []) if not s.get("archived"))
+            data = get_auth(base, token, f"/projects/{pid}/scratchpads?limit=1")
+            pads = data.get("totalCount", 0)
     except Exception:
         pass
     return todos, pads
@@ -209,91 +238,161 @@ def count_row(todos, pads, show_todos, show_pads):
 
 def deeplink(project_id, process_id, name):
     """Solo deep link to a specific process. The slug before '--' is cosmetic;
-    Solo resolves the target by the trailing numeric process id."""
-    slug = "".join(c if c.isalnum() else "-" for c in name.lower())
+    Solo resolves the target by the trailing numeric process id. Keep the slug
+    ASCII-only: SwiftBar hrefs are not percent-encoded, and a non-ASCII URL is
+    a dead (silently ignored) link on older macOS."""
+    slug = "".join(c if (c.isascii() and c.isalnum()) else "-" for c in name.lower())
     while "--" in slug:
         slug = slug.replace("--", "-")
     slug = slug.strip("-") or "x"
     return f"solo://proj/{project_id}/process/{slug}--{process_id}"
 
 
+def project_label(proj):
+    """The name Solo's own UI shows: displayName when set, else name."""
+    return proj.get("displayName") or proj.get("name", "")
+
+
 def clean(text):
-    """Make a name safe for a SwiftBar line: '|' starts the params section and a
-    newline starts a new menu item, so neutralize the pipe and collapse any
-    whitespace (newlines, tabs) to single spaces."""
-    return " ".join(text.replace("|", "│").split())
+    """Make a name safe for a SwiftBar line: '|' starts the params section, a
+    newline starts a new menu item, and a leading '--' would turn the row into
+    a submenu entry of whatever came before it. Neutralize the pipe, collapse
+    any whitespace to single spaces, and swap a leading ASCII dash for the
+    look-alike Unicode hyphen so dashed names keep their nesting level."""
+    s = " ".join(text.replace("|", "│").split())
+    if s.startswith("-"):
+        s = "‐" + s[1:]
+    return s
+
+
+def project_rows(api_base, token, projects, processes, show_all, show_todos, show_pads):
+    """The menu's project section, as a list of SwiftBar lines."""
+    procs_by_project = {}
+    for p in processes:
+        procs_by_project.setdefault(p.get("projectId"), []).append(p)
+
+    visible = []
+    for proj in projects:
+        procs = procs_by_project.get(proj["id"], [])
+        running = [p for p in procs if p.get("status") == "running"]
+        if running or show_all:
+            visible.append((proj, procs, running))
+
+    if not visible:
+        return ["No active projects | color=#999999"]
+
+    # Count fetches are independent per project; fan them out so menu-open
+    # latency is the slowest request, not the sum of up to two per project.
+    counts = {}
+    if show_todos or show_pads:
+        pids = [proj["id"] for proj, _, _ in visible]
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            results = ex.map(
+                lambda pid: project_counts(api_base, token, pid, show_todos, show_pads),
+                pids)
+            counts = dict(zip(pids, results))
+
+    rows = []
+    active_icon = ring_b64()
+    idle_icon = ring_b64(INACTIVE_COLOR) if show_all else None
+    for proj, procs, running in sorted(visible, key=lambda v: project_label(v[0]).lower()):
+        pid, name = proj["id"], project_label(proj)
+        # Open Solo focused on a process; prefer a running one. A bare
+        # solo://proj/{id} link opens Settings, not the project, so we always
+        # target a process — the header and the counts row share this link.
+        target = running[0] if running else (procs[0] if procs else None)
+        href = f" href={deeplink(pid, target['id'], target['name'])}" if target else ""
+        if running:
+            rows.append(f"{clean(name)} |{href} image={active_icon}")
+            # Each running agent deep-links to its own process.
+            for x in running:
+                rows.append(f"--{clean(x['name'])} | href={deeplink(pid, x['id'], x['name'])}")
+        else:
+            # Idle project (only in "all" view): grey ring, dimmed.
+            rows.append(f"{clean(name)} |{href} image={idle_icon} color={INACTIVE_LABEL}")
+        # Optional '└ N TODOs · M scratchpads' tree row, under any project.
+        if pid in counts:
+            row = count_row(*counts[pid], show_todos, show_pads)
+            if row:
+                rows.append(f"--{row} |{href} color={BRANCH_COLOR}")
+    return rows
+
+
+def failure_message():
+    """The most truthful error row for a failed refresh, judged from what the
+    failed request itself can't see: whether Solo ever enabled the API (the
+    discovery file exists) and whether the Solo instance that wrote the file
+    is still alive (signal 0 probes its pid without touching the process)."""
+    try:
+        with open(DISCOVERY) as f:
+            pid = json.load(f)["pid"]
+        os.kill(pid, 0)
+    except PermissionError:
+        pass  # the pid exists but isn't ours — still proof Solo is alive
+    except FileNotFoundError:
+        return "Solo HTTP API not enabled — turn it on in Solo settings"
+    except Exception:
+        # Unreadable file or dead pid: the Solo that published the API is
+        # gone. A relaunched Solo with the API off leaves this same stale
+        # file behind, so name both remedies.
+        return "Solo not running — open it, or re-enable its HTTP API"
+    return "Solo is running, but its HTTP API isn't responding"
+
+
+def error_menu(message):
+    print(f" | {icon_param()}")
+    print("---")
+    print(f"{message} | color=#999999")
+    print("Open Solo | bash=/usr/bin/open param1=-a param2=Solo terminal=false")
 
 
 def main():
-    try:
-        # GET /projects -> every project, each with a nested processes[] list
-        # ({id, name, command, status, ...}). Superset of /processes, so it
-        # serves both the "active only" and "all projects" views.
-        projects = get("/projects")
-    except Exception:
-        print(f" | {icon_param()}")
-        print("---")
-        print("Solo not running or HTTP API off | color=#999999")
-        print("Open Solo | bash=/usr/bin/open param1=-a param2=Solo terminal=false")
-        return
-
     settings = load_settings()
     show_all = bool(settings.get("show_all", False))
     show_todos = bool(settings.get("show_todos", False))
     show_pads = bool(settings.get("show_scratchpads", False))
 
-    # Todo/scratchpad counts come from authenticated /api endpoints; fetch the
-    # local token only when a counts toggle is on, and degrade if it's missing.
-    api_base, token = api_config() if (show_todos or show_pads) else (None, None)
-    counts_on = bool(token) and (show_todos or show_pads)
+    # Build every project row before printing anything: stdout IS the menu, so
+    # a failure mid-print would leave a truncated menu with no toggles. Any
+    # failure here — Solo down, auth, a pagination stall, an API shape change —
+    # lands on an error row instead.
+    try:
+        api_base, token = api_config()
+        # Projects come flat (no nested process list), so pair them with
+        # /processes and join on projectId. The "active only" view needs just
+        # the running processes; "all projects" also needs idle ones for their
+        # deep links. One endpoint covers every kind Solo tracks — commands,
+        # terminals, and agents alike — so nothing extra to fetch per kind.
+        projects = get_all(api_base, token, "/projects", "projects")
+        path = "/processes" if show_all else "/processes?status=running"
+        processes = get_all(api_base, token, path, "processes")
+        rows = project_rows(api_base, token, projects, processes,
+                            show_all, show_todos, show_pads)
+    except ApiChanged:
+        error_menu("Solo API changed — update this plugin")
+        print("Plugin releases | href=https://github.com/slaFFik/solo-menubar/releases")
+        return
+    except Exception:
+        error_menu(failure_message())
+        return
 
     # Menu bar title: Solo logo only.
     print(f" | {icon_param()}")
     print("---")
-
-    visible = []
-    for proj in projects:
-        running = [p for p in proj.get("processes", []) if p.get("status") == "running"]
-        if running or show_all:
-            visible.append((proj, running))
-
-    if not visible:
-        print("No active projects | color=#999999")
-    else:
-        active_icon = ring_b64()
-        idle_icon = ring_b64(INACTIVE_COLOR) if show_all else None
-        for proj, running in sorted(visible, key=lambda v: v[0]["name"].lower()):
-            pid, name = proj["id"], proj["name"]
-            procs = proj.get("processes", [])
-            # Open Solo focused on a process; prefer a running one. A bare
-            # solo://proj/{id} link opens Settings, not the project, so we always
-            # target a process — the header and the counts row share this link.
-            target = running[0] if running else (procs[0] if procs else None)
-            href = f" href={deeplink(pid, target['id'], target['name'])}" if target else ""
-            if running:
-                print(f"{clean(name)} |{href} image={active_icon}")
-                # Each running agent deep-links to its own process.
-                for x in running:
-                    print(f"--{clean(x['name'])} | href={deeplink(pid, x['id'], x['name'])}")
-            else:
-                # Idle project (only in "all" view): grey ring, dimmed.
-                print(f"{clean(name)} |{href} image={idle_icon} color={INACTIVE_LABEL}")
-            # Optional '└ N TODOs · M scratchpads' tree row, under any project.
-            if counts_on:
-                todos, pads = project_counts(api_base, token, pid, show_todos, show_pads)
-                row = count_row(todos, pads, show_todos, show_pads)
-                if row:
-                    print(f"--{row} |{href} color={BRANCH_COLOR}")
+    for row in rows:
+        print(row)
 
     print("---")
     py, script = sys.executable, os.path.abspath(__file__)
 
     def toggle(label, key, on):
-        return (f"{label} | checked={'true' if on else 'false'} bash={py} "
-                f"param1={script} param2=--toggle-{key.replace('_', '-')} "
+        # Quote bash/param values: SwiftBar splits unquoted params on spaces,
+        # which silently breaks paths like .../Application Support/... .
+        return (f'{label} | checked={"true" if on else "false"} bash="{py}" '
+                f'param1="{script}" param2=--toggle-{key.replace("_", "-")} '
                 f"terminal=false refresh=true")
 
-    print(toggle("Show all projects", "show_all", show_all))
+    print(toggle(f"Show all projects ({len(projects)})", "show_all", show_all))
     print(toggle("Show TODOs", "show_todos", show_todos))
     print(toggle("Show Scratchpads", "show_scratchpads", show_pads))
     print("Open Solo | bash=/usr/bin/open param1=-a param2=Solo terminal=false")
