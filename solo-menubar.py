@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <xbar.title>Solo - Active Projects</xbar.title>
-# <xbar.version>1.1.0</xbar.version>
+# <xbar.version>1.1.1</xbar.version>
 # <xbar.author>Slava Abakumov</xbar.author>
 # <xbar.author.github>slaFFik</xbar.author.github>
 # <xbar.desc>Shows Solo projects with a running process; toggle to show all.</xbar.desc>
@@ -30,6 +30,7 @@
 import base64
 import json
 import os
+import sqlite3
 import struct
 import sys
 import urllib.request
@@ -37,6 +38,10 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 DISCOVERY = os.path.expanduser("~/.config/soloterm/http-api.json")
+# Solo's persistent store. The discovery file above only exists while a Solo
+# with the API on is alive; the database remembers the user's settings across
+# quits, which is what lets the error row tell "Solo closed" from "API off".
+SOLO_DB = os.path.expanduser("~/.config/soloterm/solo.db")
 API_VERSION = "1"  # Solo's bump-on-break HTTP API contract version we speak
 
 # Solo is strictly local, so bypass proxies: the default urllib opener honors
@@ -318,11 +323,36 @@ def project_rows(api_base, token, projects, processes, show_all, show_todos, sho
     return rows
 
 
+def api_enabled_setting():
+    """What Solo's own settings say about its HTTP API: True, False, or None
+    when the database can't answer (missing, locked, or the key was renamed —
+    Solo stores the toggle as 'raycast_api_enabled', the API's original
+    Raycast-extension name). None makes the caller fall back to discovery-file
+    heuristics, so a Solo schema change degrades to the old messages rather
+    than misreporting the toggle's state."""
+    try:
+        # mode=ro so a read can never create or repair files in Solo's dir;
+        # the db is WAL, so reading doesn't block a live Solo writing it.
+        con = sqlite3.connect(f"file:{SOLO_DB}?mode=ro", uri=True, timeout=0.5)
+        try:
+            row = con.execute(
+                "SELECT value FROM settings WHERE key = 'raycast_api_enabled'"
+            ).fetchone()
+        finally:
+            con.close()
+        return None if row is None else {"true": True, "false": False}.get(row[0])
+    except Exception:
+        return None
+
+
 def failure_message():
     """The most truthful error row for a failed refresh, judged from what the
-    failed request itself can't see: whether Solo ever enabled the API (the
-    discovery file exists) and whether the Solo instance that wrote the file
-    is still alive (signal 0 probes its pid without touching the process)."""
+    failed request itself can't see. Three witnesses: Solo's settings database
+    (is the HTTP API turned on — survives quitting Solo), the discovery file
+    (did a live Solo publish the API — removed on clean quit), and the
+    publishing pid (is that Solo still alive; signal 0 probes it without
+    touching the process)."""
+    enabled = api_enabled_setting()
     try:
         with open(DISCOVERY) as f:
             pid = json.load(f)["pid"]
@@ -330,12 +360,22 @@ def failure_message():
     except PermissionError:
         pass  # the pid exists but isn't ours — still proof Solo is alive
     except FileNotFoundError:
-        return "Solo HTTP API not enabled — turn it on in Solo settings"
+        # No published API. The settings db says whether that's because the
+        # toggle is off or because Solo (which removes the file on quit)
+        # simply isn't running.
+        if enabled:
+            return "Solo not running — open it"
+        if enabled is None:
+            return "Solo HTTP API not enabled — turn it on in Solo settings"
+        return "Solo HTTP API disabled — turn it on in Solo settings"
     except Exception:
         # Unreadable file or dead pid: the Solo that published the API is
-        # gone. A relaunched Solo with the API off leaves this same stale
-        # file behind, so name both remedies.
-        return "Solo not running — open it, or re-enable its HTTP API"
+        # gone (a crash leaves this stale file behind).
+        if enabled:
+            return "Solo not running — open it"
+        if enabled is None:
+            return "Solo not running — open it, or re-enable its HTTP API"
+        return "Solo not running — open it and re-enable its HTTP API"
     return "Solo is running, but its HTTP API isn't responding"
 
 
