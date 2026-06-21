@@ -11,7 +11,8 @@ Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://g
 - Puts the Solo logo in your menu bar.
 - Click it to see every project that currently has at least one **running** process (i.e. an "active" project).
 - Optional toggles (all off by default) to also list idle projects and show per‑project TODO / scratchpad counts — see [Options](#options) below.
-- Each project — and each individual agent/terminal under it — is a clickable **deep link** that opens Solo focused on that exact process.
+- Each project — and each individual agent, terminal, or command under it — is a clickable **deep link** that opens Solo focused on that exact process.
+- Groups each project's processes by kind — **agents first, then terminals, then commands** — with a divider between groups. When an agent spawns subagents, they appear **nested underneath it** as an indented tree, mirroring Solo's own agent hierarchy.
 - Hold **⌥ Option** over a running process and the row turns into a **■ Stop** button — click to stop it, and the menu refreshes itself once Solo confirms.
 - Refreshes the moment you open the menu — no background polling.
 - Shows a friendly error state that tells you whether Solo is closed, its HTTP API is off, or the API just isn't responding.
@@ -57,6 +58,21 @@ Each time you open the menu (and once on launch), the plugin:
 
 It refreshes on open via SwiftBar's `refreshOnOpen` flag, so the list is always current the instant you click — without polling Solo in the background.
 
+### Where each feature gets its data
+
+Solo's authenticated **HTTP API** is the primary source. For the two things the API doesn't expose, the plugin takes a read‑only peek at Solo's **SQLite database** (`~/.config/soloterm/solo.db`):
+
+| Feature | HTTP API | SQLite DB |
+| --- | :---: | :---: |
+| Project & process list, deep links (incl. *Show all projects*) | ✓ | |
+| Stop a running process (⌥‑click) | ✓ | |
+| TODO counts | ✓ | |
+| Scratchpad counts | ✓ | |
+| Nesting spawned subagents under their parent | | ✓ |
+| Telling "Solo closed" from "HTTP API off" in the error row | | ✓ |
+
+The SQLite reads are opened `mode=ro` and are best‑effort: Solo records subagent lineage in `processes.parent_process_id` and the API toggle in `settings.raycast_api_enabled`, but never serves either over HTTP. If the database is missing, locked, or on an older schema, those features quietly degrade — a flat process list, or the generic error row — rather than break the menu.
+
 ## Configuration
 
 **Refresh** — by default the file is named `solo-menubar.py` (no interval), so SwiftBar refreshes it only when you open the menu. The menu bar icon is static, so background polling buys nothing. If you *do* want it to poll as well, encode an interval in the filename:
@@ -91,7 +107,7 @@ Toggles at the bottom of the menu. All are **off by default**, and your choices 
 ## Credits
 
 - [Solo](https://soloterm.com) by Aaron Francis.
-- Plugin by [Slava Abakumov](https://ovirium.com).
+- Solo Menubar by [Slava Abakumov](https://ovirium.com).
 
 ## License
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # <xbar.title>Solo - Active Projects</xbar.title>
-# <xbar.version>1.2.0</xbar.version>
+# <xbar.version>1.3.0</xbar.version>
 # <xbar.author>Slava Abakumov</xbar.author>
 # <xbar.author.github>slaFFik</xbar.author.github>
-# <xbar.desc>Shows Solo projects with a running agent; click to open it in Solo, ⌥-click to stop; toggle to display the number of TODOs/scratchpads per project.</xbar.desc>
+# <xbar.desc>Shows Solo projects with a running agent; click to open it in Solo, ⌥-click to stop; nests spawned subagents under their parent; toggle to display the number of TODOs/scratchpads per project.</xbar.desc>
 # <xbar.abouturl>https://github.com/slaFFik/solo-menubar</xbar.abouturl>
 # <xbar.image>https://raw.githubusercontent.com/slaFFik/solo-menubar/refs/heads/main/assets/screenshot.png</xbar.image>
 # <xbar.dependencies>python3,Solo</xbar.dependencies>
@@ -74,7 +74,7 @@ def icon_param():
 RING_COLOR = (0x1B, 0x88, 0x2D)     # #1B882D — active project
 INACTIVE_COLOR = (0x8E, 0x8E, 0x93)  # systemGray ring — idle project (only in "all" view)
 INACTIVE_LABEL = "#333333,#9b9b9b"   # idle project name (light,dark): dim but readable
-BRANCH_COLOR = "#666666,#9b9b9b"     # the "└ N TODOs · M scratchpads" tree row
+BRANCH_COLOR = "#666666,#9b9b9b"     # the "› N TODOs · M pads" summary row
 RING_PT = 9                      # on-screen diameter, in points
 RING_STROKE = 0.22               # ring thickness as a fraction of the diameter
 RING_DROP = 1.5                  # points to sink the ring. SwiftBar centers the
@@ -236,6 +236,34 @@ def get_all(base, token, path, key):
         offset = nxt
 
 
+def parent_map(process_ids):
+    """{child_id: parent_id} for the given visible processes, read straight from
+    Solo's database. Solo records which agent spawned each subagent in
+    processes.parent_process_id, but its HTTP API never exposes that column, so
+    the tree can only be reconstructed from the db. Read-only (mode=ro can't
+    create or repair files; WAL means it won't block a live Solo) and
+    best-effort: any failure — db missing, locked, or an older schema without
+    the column — returns {} so the menu degrades to today's flat list instead
+    of breaking. Scoping to the visible ids keeps the IN-list small and skips
+    lineage for processes we aren't drawing."""
+    ids = list(process_ids)
+    if not ids:
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{SOLO_DB}?mode=ro", uri=True, timeout=0.5)
+        try:
+            qs = ",".join("?" * len(ids))
+            rows = con.execute(
+                "SELECT id, parent_process_id FROM processes "
+                f"WHERE parent_process_id IS NOT NULL AND id IN ({qs})", ids
+            ).fetchall()
+        finally:
+            con.close()
+        return {child: parent for child, parent in rows}
+    except Exception:
+        return {}
+
+
 def project_counts(base, token, pid, want_todos, want_pads):
     """(open todo count, unarchived scratchpad count) for a project — only what
     is asked for. The server filters (completed=false; scratchpads exclude
@@ -256,14 +284,18 @@ def project_counts(base, token, pid, want_todos, want_pads):
 
 
 def count_row(todos, pads, show_todos, show_pads):
-    """The combined '└ N TODOs · M scratchpads' label, or None when there is
-    nothing to show. Only enabled, non-zero counts appear."""
+    """The combined '› N TODOs · M pads' label, or None when there is nothing to
+    show. Only enabled, non-zero counts appear. The leading '›' keeps this
+    project-level summary distinct from the └/├ tree glyphs that now mark
+    spawned subagents."""
     parts = []
     if show_todos and todos:
         parts.append(f"{todos} TODO" + ("" if todos == 1 else "s"))
     if show_pads and pads:
-        parts.append(f"{pads} scratchpad" + ("" if pads == 1 else "s"))
-    return "└ " + " · ".join(parts) if parts else None
+        # Abbreviated to "pad(s)" to keep the count row compact; the root-level
+        # toggle still spells out "Scratchpads".
+        parts.append(f"{pads} pad" + ("" if pads == 1 else "s"))
+    return "› " + " · ".join(parts) if parts else None
 
 
 def deeplink(project_id, process_id, name):
@@ -296,9 +328,79 @@ def clean(text):
 
 
 STOP_GLYPH = "■"   # ■ filled square — leads the "Stop" label in the ⌥ view
+# SwiftBar strips the whole leading whitespace run from a menu title — ordinary
+# spaces and non-breaking spaces alike — so any indent built from whitespace
+# collapses and the subagent tree goes flat. Each subagent is therefore drawn
+# with a ├/└ connector (├ when more siblings follow, └ for the last child) and
+# indented one TREE_GAP per ancestor level. TREE_GAP is U+2800 (BRAILLE PATTERN
+# BLANK): it looks like blank space but isn't whitespace, so no row ever starts
+# with a trimmable character. MONO_FONT renders the whole project submenu so
+# every glyph is one fixed-width cell and the columns line up.
+MONO_FONT = "Menlo"
+TREE_TEE = "├ "   # this subagent has more siblings below it
+TREE_LAST = "└ "  # this subagent is its parent's last child
+TREE_GAP = "⠀⠀"   # one level of indentation: blank, but not whitespace
+# SwiftBar reads a line of only dashes as a separator, with two extra dashes per
+# nesting level, so a project's submenu (one level deep) divides with five.
+SUBMENU_SEP = "-----"
+# The kinds Solo tracks, in the order they appear under a project: agents (with
+# their spawned subagents) first, then terminals, then commands. Any other kind
+# Solo adds later sorts after these, in first-seen order.
+PROCESS_KIND_ORDER = ("agent", "terminal", "command")
 
 
-def process_rows(py, script, proj_id, proc):
+def build_forest(processes, parents):
+    """Order one project's `processes` as a depth-first forest using the
+    {child_id: parent_id} lineage map. Returns a flat list of
+    (process, depth, is_last) tuples in display order: depth 0 for a top-level
+    process, deeper for each spawned subagent, and is_last True when the node is
+    its parent's final child (so the renderer picks └ over ├). A process whose
+    parent isn't in this set — a subagent still running after its spawner
+    stopped, or one filtered out of the current view — is promoted to depth 0 so
+    it is never hidden. Input order is preserved among siblings, and any node
+    trapped in a parent cycle (which ON DELETE SET NULL should prevent, but a
+    corrupt db could not) is emitted at depth 0 at the end rather than dropped or
+    looped on."""
+    by_id = {p["id"]: p for p in processes}
+    children, has_parent = {}, set()
+    for p in processes:
+        parent = parents.get(p["id"])
+        if parent is not None and parent in by_id and parent != p["id"]:
+            children.setdefault(parent, []).append(p)
+            has_parent.add(p["id"])
+    out, seen = [], set()
+
+    def walk(node, depth):
+        if node["id"] in seen:
+            return
+        seen.add(node["id"])
+        kids = children.get(node["id"], [])
+        for i, kid in enumerate(kids):
+            out.append((kid, depth, i == len(kids) - 1))
+            walk(kid, depth + 1)
+
+    for root in (p for p in processes if p["id"] not in has_parent):
+        out.append((root, 0, True))
+        walk(root, 1)
+    for p in processes:  # cycle fallback: nodes no root could reach
+        if p["id"] not in seen:
+            seen.add(p["id"])
+            out.append((p, 0, True))
+    return out
+
+
+def tree_prefix(depth, is_last):
+    """The box-drawing prefix for a subagent at this tree depth: one TREE_GAP of
+    indentation per level below the top, then └ when it is its parent's last
+    child or ├ otherwise. Top-level processes (depth 0) get no prefix. Built only
+    from non-whitespace glyphs so SwiftBar's leading-whitespace trim can't
+    flatten it."""
+    if depth <= 0:
+        return ""
+    return TREE_GAP * (depth - 1) + (TREE_LAST if is_last else TREE_TEE)
+
+
+def process_rows(py, script, proj_id, proc, prefix=""):
     """The two SwiftBar lines for one running process, sharing a single visible
     row via the Option-key alternate mechanism:
 
@@ -310,16 +412,47 @@ def process_rows(py, script, proj_id, proc):
 
     Both are at the same submenu level and the alternate immediately follows its
     primary, which is how SwiftBar pairs them. The primary's tooltip advertises
-    the otherwise-hidden ⌥ action."""
+    the otherwise-hidden ⌥ action. `prefix` is the box-drawing tree prefix for a
+    spawned subagent (empty for a top-level process). Both rows render in
+    MONO_FONT so the tree lines up on a fixed grid; the Stop alternate blanks the
+    prefix to the same width with braille blanks so its ■ stays aligned under the
+    name when ⌥ is held."""
     name = clean(proc["name"])
     proc_id = proc["id"]
-    primary = (f"--{name} | href={deeplink(proj_id, proc_id, proc['name'])} "
-               f'tooltip="Click to open in Solo · hold ⌥ to stop"')
-    stop = (f"--{STOP_GLYPH} Stop {name} | alternate=true "
+    gap = TREE_GAP[:1] * len(prefix)  # braille-blank pad, matching the prefix width
+    primary = (f"--{prefix}{name} | href={deeplink(proj_id, proc_id, proc['name'])} "
+               f'font={MONO_FONT} tooltip="Click to open in Solo · hold ⌥ to stop"')
+    stop = (f"--{gap}{STOP_GLYPH} Stop {name} | alternate=true "
             f'bash="{py}" param1="{script}" '
             f'param2=--stop-process param3={proc_id} '
-            f'terminal=false refresh=true tooltip="Click to stop"')
+            f'font={MONO_FONT} terminal=false refresh=true tooltip="Click to stop"')
     return [primary, stop]
+
+
+def process_sections(py, script, pid, running, parents):
+    """One project's running processes split into ordered sections — agents,
+    terminals, commands, then any other kind — each a list of SwiftBar rows. The
+    caller drops the empty ones and draws a separator between the rest. Only
+    agents can spawn subagents, so just that group is run through build_forest to
+    nest them; the others stay flat."""
+    by_kind = {}
+    for p in running:
+        by_kind.setdefault(p.get("kind"), []).append(p)
+    ordered = list(PROCESS_KIND_ORDER) + [k for k in by_kind
+                                          if k not in PROCESS_KIND_ORDER]
+    sections = []
+    for kind in ordered:
+        group = by_kind.get(kind, [])
+        section = []
+        if kind == "agent":
+            for proc, depth, is_last in build_forest(group, parents):
+                section.extend(process_rows(py, script, pid, proc,
+                                             tree_prefix(depth, is_last)))
+        else:
+            for proc in group:
+                section.extend(process_rows(py, script, pid, proc))
+        sections.append(section)
+    return sections
 
 
 def project_rows(api_base, token, projects, processes, show_all, show_todos, show_pads,
@@ -350,6 +483,11 @@ def project_rows(api_base, token, projects, processes, show_all, show_todos, sho
                 pids)
             counts = dict(zip(pids, results))
 
+    # Subagent lineage lives only in Solo's db, not the HTTP API, so resolve it
+    # in one read-only query over the processes we're about to draw; build_forest
+    # then nests each spawned subagent under its parent.
+    parents = parent_map(p["id"] for _, _, running in visible for p in running)
+
     rows = []
     active_icon = ring_b64()
     idle_icon = ring_b64(INACTIVE_COLOR) if show_all else None
@@ -361,19 +499,27 @@ def project_rows(api_base, token, projects, processes, show_all, show_todos, sho
         target = running[0] if running else (procs[0] if procs else None)
         href = f" href={deeplink(pid, target['id'], target['name'])}" if target else ""
         if running:
-            rows.append(f"{clean(name)} |{href} image={active_icon}")
             # Each running process is one visible row: click opens it in Solo,
-            # ⌥-click stops it (the alternate row emitted alongside).
-            for x in running:
-                rows.extend(process_rows(py, script, pid, x))
+            # ⌥-click stops it (the alternate row emitted alongside). Rows are
+            # grouped by kind — agents (with subagents nested under them),
+            # terminals, commands — and a divider sets each group apart.
+            rows.append(f"{clean(name)} |{href} image={active_icon}")
+            sections = process_sections(py, script, pid, running, parents)
         else:
             # Idle project (only in "all" view): grey ring, dimmed.
             rows.append(f"{clean(name)} |{href} image={idle_icon} color={INACTIVE_LABEL}")
-        # Optional '└ N TODOs · M scratchpads' tree row, under any project.
+            sections = []
+        # Optional '› N TODOs · M pads' row, its own section so the divider
+        # sets it apart from the processes above.
         if pid in counts:
             row = count_row(*counts[pid], show_todos, show_pads)
             if row:
-                rows.append(f"--{row} |{href} color={BRANCH_COLOR}")
+                sections.append([f"--{row} |{href} font={MONO_FONT} color={BRANCH_COLOR}"])
+        # Draw the non-empty sections, a submenu divider between each.
+        for i, section in enumerate(s for s in sections if s):
+            if i:
+                rows.append(SUBMENU_SEP)
+            rows.extend(section)
     return rows
 
 
