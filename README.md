@@ -12,6 +12,7 @@ Built as a [SwiftBar](https://github.com/swiftbar/SwiftBar) (or [xbar](https://g
 - Click it to see every project that currently has at least one **running** process (i.e. an "active" project).
 - Optional toggles (all off by default) to also list idle projects and show per‑project TODO / scratchpad counts — see [Options](#options) below.
 - Each project — and each individual agent/terminal under it — is a clickable **deep link** that opens Solo focused on that exact process.
+- Hold **⌥ Option** over a running process and the row turns into a **■ Stop** button — click to stop it, and the menu refreshes itself once Solo confirms.
 - Refreshes the moment you open the menu — no background polling.
 - Shows a friendly error state that tells you whether Solo is closed, its HTTP API is off, or the API just isn't responding.
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # <xbar.title>Solo - Active Projects</xbar.title>
-# <xbar.version>1.1.1</xbar.version>
+# <xbar.version>1.2.0</xbar.version>
 # <xbar.author>Slava Abakumov</xbar.author>
 # <xbar.author.github>slaFFik</xbar.author.github>
-# <xbar.desc>Shows Solo projects with a running process; toggle to show all.</xbar.desc>
+# <xbar.desc>Shows Solo projects with a running agent; click to open it in Solo, ⌥-click to stop; toggle to display the number of TODOs/scratchpads per project.</xbar.desc>
 # <xbar.abouturl>https://github.com/slaFFik/solo-menubar</xbar.abouturl>
 # <xbar.image>https://raw.githubusercontent.com/slaFFik/solo-menubar/refs/heads/main/assets/screenshot.png</xbar.image>
 # <xbar.dependencies>python3,Solo</xbar.dependencies>
@@ -19,8 +19,9 @@
 # 0.8.2 every endpoint lives under /api behind bearer auth; the token comes
 # from Solo's own discovery file, so the widget still needs nothing from the
 # user. By default it shows only projects with a running process; a menu
-# toggle switches to all projects. Solo (>= 0.8.2) must be running with the
-# HTTP API enabled.
+# toggle switches to all projects. Clicking a running process opens it in
+# Solo; ⌥-click stops it. Solo (>= 0.8.2) must be running with the HTTP API
+# enabled.
 #
 # Symlink this file into your SwiftBar plugin folder. With no interval in the
 # filename (solo-menubar.py), SwiftBar refreshes it only when the menu opens (via
@@ -193,6 +194,30 @@ def get_auth(base, token, path):
         return json.load(r)["data"]
 
 
+def post_auth(base, token, path):
+    """POST to one of Solo's authenticated lifecycle endpoints. They take no
+    body (data=b"" just forces the POST method), so this returns the parsed
+    envelope's data without sending anything. Used by the Stop action."""
+    req = urllib.request.Request(base + path, data=b"", method="POST")
+    req.add_header("Authorization", "Bearer " + token)
+    with OPENER.open(req, timeout=8) as r:
+        return json.load(r)["data"]
+
+
+def stop_process(process_id):
+    """Stop one running Solo process, fired from a menu click. Best-effort and
+    silent: a SwiftBar bash action has nowhere to surface an error, and the
+    follow-up refresh just re-lists the process if the stop didn't take.
+    Blocking on the POST is the whole point — it makes SwiftBar's refresh=true
+    land only after Solo has actually replied, so the row visibly disappears.
+    int() both coerces the id for the path and rejects junk into the no-op."""
+    try:
+        base, token = api_config()
+        post_auth(base, token, f"/processes/{int(process_id)}/stop")
+    except Exception:
+        pass
+
+
 def get_all(base, token, path, key):
     """Every item from a paginated list endpoint, following nextOffset pages
     until hasMore goes false. Asks for big pages (the server clamps at its own
@@ -270,7 +295,35 @@ def clean(text):
     return s
 
 
-def project_rows(api_base, token, projects, processes, show_all, show_todos, show_pads):
+STOP_GLYPH = "■"   # ■ filled square — leads the "Stop" label in the ⌥ view
+
+
+def process_rows(py, script, proj_id, proc):
+    """The two SwiftBar lines for one running process, sharing a single visible
+    row via the Option-key alternate mechanism:
+
+      * the primary row opens the process in Solo (a plain href leaf, so one
+        click still focuses that window — the original behavior), and
+      * the alternate row (alternate=true → shown only while ⌥ is held) replaces
+        it in place with a Stop action that refreshes the menu, so the row drops
+        out the moment Solo confirms the stop.
+
+    Both are at the same submenu level and the alternate immediately follows its
+    primary, which is how SwiftBar pairs them. The primary's tooltip advertises
+    the otherwise-hidden ⌥ action."""
+    name = clean(proc["name"])
+    proc_id = proc["id"]
+    primary = (f"--{name} | href={deeplink(proj_id, proc_id, proc['name'])} "
+               f'tooltip="Click to open in Solo · hold ⌥ to stop"')
+    stop = (f"--{STOP_GLYPH} Stop {name} | alternate=true "
+            f'bash="{py}" param1="{script}" '
+            f'param2=--stop-process param3={proc_id} '
+            f'terminal=false refresh=true tooltip="Click to stop"')
+    return [primary, stop]
+
+
+def project_rows(api_base, token, projects, processes, show_all, show_todos, show_pads,
+                 py, script):
     """The menu's project section, as a list of SwiftBar lines."""
     procs_by_project = {}
     for p in processes:
@@ -309,9 +362,10 @@ def project_rows(api_base, token, projects, processes, show_all, show_todos, sho
         href = f" href={deeplink(pid, target['id'], target['name'])}" if target else ""
         if running:
             rows.append(f"{clean(name)} |{href} image={active_icon}")
-            # Each running agent deep-links to its own process.
+            # Each running process is one visible row: click opens it in Solo,
+            # ⌥-click stops it (the alternate row emitted alongside).
             for x in running:
-                rows.append(f"--{clean(x['name'])} | href={deeplink(pid, x['id'], x['name'])}")
+                rows.extend(process_rows(py, script, pid, x))
         else:
             # Idle project (only in "all" view): grey ring, dimmed.
             rows.append(f"{clean(name)} |{href} image={idle_icon} color={INACTIVE_LABEL}")
@@ -391,6 +445,9 @@ def main():
     show_all = bool(settings.get("show_all", False))
     show_todos = bool(settings.get("show_todos", False))
     show_pads = bool(settings.get("show_scratchpads", False))
+    # How SwiftBar must re-invoke this script for click actions (toggles and
+    # the per-process Stop button). Computed once and shared by both.
+    py, script = sys.executable, os.path.abspath(__file__)
 
     # Build every project row before printing anything: stdout IS the menu, so
     # a failure mid-print would leave a truncated menu with no toggles. Any
@@ -407,7 +464,7 @@ def main():
         path = "/processes" if show_all else "/processes?status=running"
         processes = get_all(api_base, token, path, "processes")
         rows = project_rows(api_base, token, projects, processes,
-                            show_all, show_todos, show_pads)
+                            show_all, show_todos, show_pads, py, script)
     except ApiChanged:
         error_menu("Solo API changed — update this plugin")
         print("Plugin releases | href=https://github.com/slaFFik/solo-menubar/releases")
@@ -423,7 +480,6 @@ def main():
         print(row)
 
     print("---")
-    py, script = sys.executable, os.path.abspath(__file__)
 
     def toggle(label, key, on):
         # Quote bash/param values: SwiftBar splits unquoted params on spaces,
@@ -441,9 +497,13 @@ def main():
 
 if __name__ == "__main__":
     KEYS = {"show_all", "show_todos", "show_scratchpads"}
+    args = sys.argv[1:]
     toggled = next((a[len("--toggle-"):].replace("-", "_")
-                    for a in sys.argv[1:] if a.startswith("--toggle-")), None)
-    if toggled in KEYS:
+                    for a in args if a.startswith("--toggle-")), None)
+    if "--stop-process" in args:
+        i = args.index("--stop-process")
+        stop_process(args[i + 1] if i + 1 < len(args) else "")
+    elif toggled in KEYS:
         toggle_setting(toggled)
     else:
         main()
