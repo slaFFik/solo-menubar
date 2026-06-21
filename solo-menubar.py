@@ -493,6 +493,8 @@ def main():
     print(toggle("Show Scratchpads", "show_scratchpads", show_pads))
     print("Open Solo | bash=/usr/bin/open param1=-a param2=Solo terminal=false")
     print("Refresh | refresh=true")
+    print("---")
+    print("About Solo Menubar | href=https://github.com/slaFFik/solo-menubar")
 
 
 if __name__ == "__main__":
