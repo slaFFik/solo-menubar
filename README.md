@@ -91,7 +91,7 @@ Toggles at the bottom of the menu. All are **off by default**, and your choices 
 ## Credits
 
 - [Solo](https://soloterm.com) by Aaron Francis.
-- Plugin by [Slava Abakumov](https://github.com/slaFFik).
+- Plugin by [Slava Abakumov](https://ovirium.com).
 
 ## License
 
